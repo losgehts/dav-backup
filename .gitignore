@@ -1,0 +1,24 @@
+# credentials
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# virtualenv
+venv/
+
+# logs
+logs/
+*.log
+
+# backups
+backups/
+
+# editor
+.vscode/
+.idea/
+
+# system
+.DS_Store

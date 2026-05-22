@@ -15,18 +15,6 @@ It supports:
 
 The project works well with providers like mailbox.org, Nextcloud, or any CalDAV/CardDAV server.
 
----
-
-# Repository Contents
-
-backup.py  
-install.sh  
-dav-backup-run.sh  
-requirements.txt  
-example.env  
-.gitignore  
-
----
 
 # Features
 
@@ -66,8 +54,10 @@ backups/
 
 Clone the repository:
 
+```
 git clone <repository-url>
 cd dav-backup
+```
 
 Copy the example configuration:
 ```
@@ -84,7 +74,9 @@ PASSWORD=mypassword
 
 Run the installer as root:
 
+```
 sudo bash install.sh
+```
 
 The installer will:
 - create the `davbackup` user
@@ -101,7 +93,9 @@ The installer will:
 
 Run manually:
 
+```
 dav-backup-run.sh
+```
 
 This script:
 - runs backup with correct Python environment

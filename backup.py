@@ -2,14 +2,14 @@
 
 import os
 import fcntl
-import atexit
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 import shutil
 import tempfile
 import sys
+import signal
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -20,16 +20,14 @@ from icalendar import Calendar
 from dotenv import dotenv_values
 
 
-# ============================================================
+# =========================================================
 # KONFIGURATION
-# ============================================================
-
-LOCK_FILE = "/tmp/dav-backup.lock"
-# LOCK_FILE = "/var/lock/dav-backup.lock" => Schreibreichte!!
+# =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 
 BACKUP_DIR = BASE_DIR / "backups"
+
 CALENDAR_DIR = BACKUP_DIR / "calendar"
 CONTACTS_DIR = BACKUP_DIR / "contacts"
 
@@ -40,15 +38,23 @@ ENV_FILE = BASE_DIR / ".env"
 
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
+LOCK_FILE = BASE_DIR / f".backup_{TODAY}.lock"
 
-# ============================================================
+SUCCESS_MARKER = ".backup_complete"
+
+# =========================================================
 # LOGGING
-# ============================================================
+# =========================================================
 
 def setup_logging() -> logging.Logger:
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("dav_backup")
+
+    if logger.handlers:
+        return logger
+
     logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
@@ -78,9 +84,20 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 
-# ============================================================
+# =========================================================
+# SIGNAL HANDLING
+# =========================================================
+def handle_signal(signum, frame):
+    logger.warning(f"Signal empfangen: {signum}")
+    cleanup_and_exit(1)
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
+
+
+# =========================================================
 # HILFSFUNKTIONEN
-# ============================================================
+# =========================================================
 
 def sanitize_filename(name: str) -> str:
     return "".join(
@@ -90,14 +107,16 @@ def sanitize_filename(name: str) -> str:
 
 
 def load_config():
+
     if not ENV_FILE.exists():
         logger.error(".env Datei nicht gefunden")
         sys.exit(1)
-    
+
     env_stat = ENV_FILE.stat()
+
     if env_stat.st_mode & 0o077:
         logger.warning(
-            ".env ist für andere Benutzer lesbar!"
+            ".env ist für andere Benutzer lesbar"
         )
 
     config = dotenv_values(ENV_FILE)
@@ -109,75 +128,101 @@ def load_config():
         "PASSWORD",
     ]
 
-    missing = [key for key in required if key not in config]
+    missing = [
+        key for key in required
+        if not config.get(key)
+    ]
 
     if missing:
-        logger.error(f"Fehlende Konfiguration: {', '.join(missing)}")
+        logger.error(
+            f"Fehlende Konfiguration: {', '.join(missing)}"
+        )
         sys.exit(1)
 
     return config
 
 
-def backup_exists() -> bool:
-    calendar_today = CALENDAR_DIR / TODAY
-    contacts_today = CONTACTS_DIR / TODAY
-
-    return calendar_today.exists() or contacts_today.exists()
-
-
 def create_atomic_directory(target_dir: Path) -> Path:
-    temp_dir = Path(
+
+    return Path(
         tempfile.mkdtemp(
             prefix=f"{target_dir.name}_",
             dir=target_dir.parent
         )
     )
 
-    return temp_dir
 
+def finalize_backup(temp_dir: Path, target_dir: Path):
 
-def acquire_lock():
-    lock_fp = open(LOCK_FILE, "w")
+    marker = temp_dir / SUCCESS_MARKER
+    marker.write_text(
+        datetime.now().isoformat(),
+        encoding="utf-8"
+    )
 
-    try:
-        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    except BlockingIOError:
-        logger.warning(
-            "Backup läuft bereits. Abbruch."
+    if target_dir.exists():
+        raise RuntimeError(
+            f"Zielverzeichnis existiert bereits: "
+            f"{target_dir}"
         )
-        sys.exit(1)
 
-    lock_fp.write(str(os.getpid()))
-    lock_fp.flush()
-
-    def cleanup():
-        try:
-            fcntl.flock(lock_fp, fcntl.LOCK_UN)
-            lock_fp.close()
-
-        except Exception:
-            pass
-
-    atexit.register(cleanup)
-
-    return lock_fp
+    temp_dir.rename(target_dir)
 
 
-# ============================================================
+def backup_complete(target_dir: Path) -> bool:
+
+    marker = target_dir / SUCCESS_MARKER
+
+    return (
+        target_dir.exists()
+        and target_dir.is_dir()
+        and marker.exists()
+    )
+
+
+def remove_incomplete_backup(target_dir: Path):
+
+    if target_dir.exists():
+
+        marker = target_dir / SUCCESS_MARKER
+
+        if not marker.exists():
+
+            logger.warning(
+                f"Entferne unvollständiges Backup: "
+                f"{target_dir}"
+            )
+
+            shutil.rmtree(
+                target_dir,
+                ignore_errors=True
+            )
+
+
+
+# =========================================================
 # KALENDER BACKUP
-# ============================================================
+# =========================================================
 
 def backup_calendars(config):
+
     logger.info("Starte Kalender-Backup")
 
-    CALENDAR_DIR.mkdir(parents=True, exist_ok=True)
+    CALENDAR_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     target_dir = CALENDAR_DIR / TODAY
 
+    remove_incomplete_backup(target_dir)
+
     temp_dir = create_atomic_directory(target_dir)
 
+    success_count = 0
+
     try:
+
         client = DAVClient(
             url=config["CALDAV_URL"],
             username=config["USERNAME"],
@@ -188,21 +233,35 @@ def backup_calendars(config):
 
         calendars = principal.calendars()
 
-        logger.debug(f"{len(calendars)} Kalender gefunden")
+        logger.debug(
+            f"{len(calendars)} Kalender gefunden"
+        )
 
         for calendar in calendars:
+
             try:
+
+                display_name = (
+                    calendar.get_display_name()
+                    or "calendar"
+                )
+
                 logger.debug(
-                    f"Exportiere Kalender: {calendar.get_display_name()}"
+                    f"Exportiere Kalender: "
+                    f"{display_name}"
                 )
 
                 cal = Calendar()
 
-                for event in calendar.events():
-                    cal.add_component(event.icalendar_instance)
+                events = calendar.events()
+
+                for event in events:
+                    cal.add_component(
+                        event.icalendar_instance
+                    )
 
                 filename = (
-                    f"{sanitize_filename(calendar.get_display_name())}.ics"
+                    f"{sanitize_filename(display_name)}.ics"
                 )
 
                 filepath = temp_dir / filename
@@ -210,38 +269,57 @@ def backup_calendars(config):
                 with open(filepath, "wb") as f:
                     f.write(cal.to_ical())
 
+                success_count += 1
+
                 logger.debug(
-                    f"Kalender gespeichert: {filepath.name}"
+                    f"Kalender gespeichert: "
+                    f"{filepath.name}"
                 )
 
-            except Exception as e:
-                logger.error(
+            except Exception:
+                logger.exception(
                     f"Fehler bei Kalender "
-                    f"'{calendar.name}': {e}"
+                    f"'{calendar.name}'"
                 )
 
-        temp_dir.rename(target_dir)
+        if success_count == 0:
+            raise RuntimeError(
+                "Kein Kalender erfolgreich exportiert"
+            )
 
-        logger.info("Kalender-Backup abgeschlossen")
+        finalize_backup(temp_dir, target_dir)
 
-    except Exception as e:
-        logger.error(f"Kalender-Backup fehlgeschlagen: {e}")
+        logger.info(
+            f"Kalender-Backup abgeschlossen "
+            f"({success_count} erfolgreich)"
+        )
 
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True
+        )
 
         raise
 
 
-# ============================================================
-# KONTAKT BACKUP
-# ============================================================
+# =========================================================
+# KONTAKTE BACKUP
+# =========================================================
 
 def backup_contacts(config):
+
     logger.info("Starte Kontakte-Backup")
 
-    CONTACTS_DIR.mkdir(parents=True, exist_ok=True)
+    CONTACTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     target_dir = CONTACTS_DIR / TODAY
+
+    remove_incomplete_backup(target_dir)
 
     temp_dir = create_atomic_directory(target_dir)
 
@@ -256,21 +334,24 @@ def backup_contacts(config):
     }
 
     propfind_body = """<?xml version="1.0" encoding="utf-8" ?>
-    <d:propfind xmlns:d="DAV:"
-                xmlns:cs="http://calendarserver.org/ns/">
+    <d:propfind xmlns:d="DAV:">
       <d:prop>
         <d:displayname />
       </d:prop>
     </d:propfind>
     """
 
+    success_count = 0
+
     try:
+
         response = requests.request(
             "PROPFIND",
             config["CARDDAV_URL"],
             headers=headers,
             data=propfind_body,
             auth=auth,
+            timeout=60,
         )
 
         response.raise_for_status()
@@ -286,20 +367,23 @@ def backup_contacts(config):
         for resp in xml.findall("d:response", ns):
 
             href = resp.find("d:href", ns)
+
             displayname = resp.find(
                 ".//d:displayname",
                 ns
             )
 
-            if href is not None:
-                addressbooks.append({
-                    "url": href.text,
-                    "name": (
-                        displayname.text
-                        if displayname is not None
-                        else "adressbuch"
-                    )
-                })
+            if href is None:
+                continue
+
+            addressbooks.append({
+                "url": href.text,
+                "name": (
+                    displayname.text
+                    if displayname is not None
+                    else "adressbuch"
+                )
+            })
 
         logger.debug(
             f"{len(addressbooks)} Addressbooks gefunden"
@@ -308,6 +392,7 @@ def backup_contacts(config):
         for abook in addressbooks:
 
             try:
+
                 logger.debug(
                     f"Exportiere Addressbook: "
                     f"{abook['name']}"
@@ -316,22 +401,22 @@ def backup_contacts(config):
                 abook_url = abook["url"]
 
                 if abook_url.startswith("/"):
+
                     parsed = requests.utils.urlparse(
                         config["CARDDAV_URL"]
                     )
 
-                    base = (
-                        f"{parsed.scheme}://{parsed.netloc}"
+                    abook_url = (
+                        f"{parsed.scheme}"
+                        f"://{parsed.netloc}"
+                        f"{abook_url}"
                     )
 
-                    abook_url = base + abook_url
-
-                report_body = """<?xml version="1.0"
-encoding="utf-8" ?>
+                report_body = """<?xml version="1.0" encoding="utf-8" ?>
                 <d:propfind xmlns:d="DAV:">
-                <d:prop>
+                  <d:prop>
                     <d:getcontenttype />
-                </d:prop>
+                  </d:prop>
                 </d:propfind>
                 """
 
@@ -341,6 +426,7 @@ encoding="utf-8" ?>
                     headers=headers,
                     data=report_body,
                     auth=auth,
+                    timeout=60,
                 )
 
                 r.raise_for_status()
@@ -356,46 +442,55 @@ encoding="utf-8" ?>
                     ns
                 ):
 
-                    href = resp.find("d:href", ns)
+                    href = resp.find(
+                        "d:href",
+                        ns
+                    )
 
                     if href is None:
                         continue
 
                     href_text = href.text
 
-                    if href_text.endswith(".vcf"):
+                    if not href_text.endswith(".vcf"):
+                        continue
 
-                        contact_url = href_text
+                    contact_url = href_text
 
-                        if contact_url.startswith("/"):
+                    if contact_url.startswith("/"):
 
-                            parsed = (
-                                requests.utils.urlparse(
-                                    config["CARDDAV_URL"]
-                                )
+                        parsed = (
+                            requests.utils.urlparse(
+                                config["CARDDAV_URL"]
                             )
-
-                            base = (
-                                f"{parsed.scheme}"
-                                f"://{parsed.netloc}"
-                            )
-
-                            contact_url = (
-                                base + contact_url
-                            )
-
-                        c = requests.get(
-                            contact_url,
-                            auth=auth
                         )
 
-                        c.raise_for_status()
+                        contact_url = (
+                            f"{parsed.scheme}"
+                            f"://{parsed.netloc}"
+                            f"{contact_url}"
+                        )
 
-                        contacts.append(c.text)
+                    c = requests.get(
+                        contact_url,
+                        auth=auth,
+                        timeout=60,
+                    )
+
+                    c.raise_for_status()
+
+                    contacts.append(c.text)
+
+                if not contacts:
+
+                    logger.info(
+                        f"Addressbook '{abook['name']}' "
+                        f"ist leer"
+                    )
 
                 safe_name = sanitize_filename(
                     abook["name"]
-                )
+                ) or "addressbook"
 
                 backup_file = (
                     temp_dir / f"{safe_name}.vcf"
@@ -408,39 +503,50 @@ encoding="utf-8" ?>
                 ) as f:
 
                     for contact in contacts:
+
                         f.write(contact)
 
                         if not contact.endswith("\n"):
                             f.write("\n")
+
+                success_count += 1
 
                 logger.debug(
                     f"Addressbook gespeichert: "
                     f"{backup_file.name}"
                 )
 
-            except Exception as e:
-                logger.error(
+            except Exception:
+                logger.exception(
                     f"Fehler bei Addressbook "
-                    f"{abook['name']}: {e}"
+                    f"{abook['name']}"
                 )
 
-        temp_dir.rename(target_dir)
+        if success_count == 0:
+            raise RuntimeError(
+                "Kein Addressbook erfolgreich exportiert"
+            )
 
-        logger.info("Kontakte-Backup abgeschlossen")
+        finalize_backup(temp_dir, target_dir)
 
-    except Exception as e:
-        logger.error(
-            f"Kontakte-Backup fehlgeschlagen: {e}"
+        logger.info(
+            f"Kontakte-Backup abgeschlossen "
+            f"({success_count} erfolgreich)"
         )
 
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True
+        )
 
         raise
 
 
-# ============================================================
+# =========================================================
 # RETENTION POLICY
-# ============================================================
+# =========================================================
 
 def should_keep_backup(
     backup_date: date,
@@ -463,6 +569,7 @@ def should_keep_backup(
 
 
 def cleanup_backups(base_dir: Path):
+
     logger.info(
         f"Starte Bereinigung: {base_dir.name}"
     )
@@ -477,7 +584,24 @@ def cleanup_backups(base_dir: Path):
         if not path.is_dir():
             continue
 
+        marker = path / SUCCESS_MARKER
+
+        if not marker.exists():
+
+            logger.warning(
+                f"Unvollständiges Backup entfernt: "
+                f"{path.name}"
+            )
+
+            shutil.rmtree(
+                path,
+                ignore_errors=True
+            )
+
+            continue
+
         try:
+
             backup_date = datetime.strptime(
                 path.name,
                 "%Y-%m-%d"
@@ -486,6 +610,7 @@ def cleanup_backups(base_dir: Path):
             backups.append((backup_date, path))
 
         except ValueError:
+
             logger.warning(
                 f"Ungültiger Backupordner ignoriert: "
                 f"{path.name}"
@@ -502,68 +627,126 @@ def cleanup_backups(base_dir: Path):
             backup_date,
             newest_date
         ):
+
             logger.debug(
                 f"Behalte Backup: {path.name}"
             )
+
             continue
 
         logger.info(
             f"Lösche altes Backup: {path}"
         )
 
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(
+            path,
+            ignore_errors=True
+        )
 
 
-# ============================================================
+# =========================================================
+# LOCK:  no parallel runs
+# =========================================================
+fd = None
+
+def acquire_lock():
+    global fd
+    fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+
+
+def cleanup_and_exit(code=1):
+    global fd
+    if fd is not None:
+        try:
+            os.close(fd)
+            os.remove(LOCK_FILE)
+        except Exception:
+            pass
+    sys.exit(code)
+
+
+# =========================================================
 # MAIN
-# ============================================================
-
+# =========================================================
 def main():
 
-    logger.info("================================")
-    logger.info("Backup gestartet")
-    logger.info("================================")
-
-    acquire_lock()
-
-    if backup_exists():
-        logger.warning(
-            "Backup für heute existiert bereits. "
-            "Abbruch."
-        )
-        return
-
-    config = load_config()
+    exitcode = 0
 
     try:
-        backup_calendars(config)
-
-    except Exception:
-        logger.exception(
-            "Kalender-Backup vollständig fehlgeschlagen"
-        )
-
-    # try:
-    #     backup_contacts(config)
-
-    # except Exception:
-    #     logger.exception(
-    #         "Kontakte-Backup vollständig fehlgeschlagen"
-    #     )
+        acquire_lock()
+    except FileExistsError:
+        logger.warning("Backup läuft bereits")
+        # keincleanup_lock(fd) !! sondern sofortiger Abbruch
+        sys.exit(0)
 
     try:
-        cleanup_backups(CALENDAR_DIR)
-        cleanup_backups(CONTACTS_DIR)
+        logger.info("================================")
+        logger.info("Backup gestartet")
+        logger.info("================================")
 
-    except Exception:
-        logger.exception(
-            "Fehler bei Backup-Bereinigung"
-        )
+        config = load_config()
 
-    logger.info("================================")
-    logger.info("Backup beendet")
-    logger.info("================================")
 
+        # Kalender
+        try:
+
+            if backup_complete(CALENDAR_DIR / TODAY):
+                logger.warning(
+                    "Kalenderbackup bereits vollständig."
+                    "Wird nicht erneut angelegt."
+                )
+            else:
+                backup_calendars(config)
+
+        except Exception:
+
+            logger.exception(
+                "Kalender-Backup vollständig fehlgeschlagen"
+            )
+            exitcode += 10
+
+
+
+        # Kontakte
+        try:
+
+            if backup_complete(CONTACTS_DIR / TODAY):
+                logger.warning(
+                    "Kontaktebackup bereits vollständig."
+                    "Wird nicht erneut angelegt."
+                )
+
+            else:
+                backup_contacts(config)
+
+        except Exception:
+
+            logger.exception(
+                "Kontakte-Backup vollständig fehlgeschlagen"
+            )
+            exitcode += 100
+
+        # alte Backups loeschen
+        try:
+
+            cleanup_backups(CALENDAR_DIR)
+            cleanup_backups(CONTACTS_DIR)
+
+        except Exception:
+
+            logger.exception(
+                "Fehler bei Backup-Bereinigung"
+            )
+            exitcode += 1000
+
+
+        logger.info("================================")
+        logger.info("Backup beendet")
+        logger.info("================================")
+
+    finally:
+        if fd is not None:
+            cleanup_and_exit(exitcode)
 
 if __name__ == "__main__":
     main()
